@@ -342,6 +342,26 @@ contract PegFeeHookTest is Test {
         assertEq(hook.sweep(c), 0, "nothing left");
     }
 
+    /// @dev The surcharge in REAL USDC, swept to the Treasury: the path the live pool will use.
+    function test_realUsdcSurchargeIsSweptToTheTreasury() public {
+        address realUsdc = 0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48;
+        Tok st = new Tok("imdUSD5", 18);
+        PegFeeHook h = _deployHook(address(st), realUsdc);
+        PoolKey memory k = _key(h, 100, 1);
+        PM.initialize(k, h.pegSqrtPriceX96());
+        st.transfer(address(router), 1e30);
+        deal(realUsdc, address(router), 10_000_000e6);
+        router.addLiquidity(k, ModifyLiquidityParams(TickMath.MIN_TICK, TickMath.MAX_TICK, 1e15, 0));
+        bool zeroForOne = h.stableIsToken0(); // sells imdUSD for USDC: the surcharge is in USDC
+        uint256 rel = h.stableIsToken0() ? 0.97e18 : uint256(1e36) / 0.97e18;
+        router.swap(k, SwapParams(zeroForOne, -1e24, uint160(h.pegSqrtPriceX96() * _sqrt(rel * 1e18) / 1e18)));
+        uint256 claims = PM.balanceOf(address(h), uint256(uint160(realUsdc)));
+        assertGt(claims, 0);
+        uint256 before = ERC20(realUsdc).balanceOf(TREASURY);
+        assertEq(h.sweep(Currency.wrap(realUsdc)), claims);
+        assertEq(ERC20(realUsdc).balanceOf(TREASURY) - before, claims, "real USDC at the Treasury");
+    }
+
     /// @dev Re-audit medium: a Treasury the token refuses (a USDC blacklist) used to revert every surcharged swap.
     function test_aTreasuryTheTokenRefusesNeverStopsASwap() public {
         Refusing q = new Refusing(TREASURY);
