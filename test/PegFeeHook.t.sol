@@ -121,8 +121,7 @@ contract PegFeeHookTest is Test {
     function _deployHook(address stable, address quote) private returns (PegFeeHook h) {
         bytes memory init = abi.encodePacked(type(PegFeeHook).creationCode, abi.encode(PM, stable, quote, TREASURY));
         bytes32 initHash = keccak256(init);
-        uint160 flags = Hooks.BEFORE_INITIALIZE_FLAG | Hooks.BEFORE_ADD_LIQUIDITY_FLAG | Hooks.AFTER_SWAP_FLAG
-            | Hooks.AFTER_SWAP_RETURNS_DELTA_FLAG;
+        uint160 flags = Hooks.BEFORE_INITIALIZE_FLAG | Hooks.AFTER_SWAP_FLAG | Hooks.AFTER_SWAP_RETURNS_DELTA_FLAG;
         for (uint256 salt;; ++salt) {
             address a = vm.computeCreate2Address(bytes32(salt), initHash, address(this));
             if (uint160(a) & Hooks.ALL_HOOK_MASK == flags) {
@@ -386,30 +385,46 @@ contract PegFeeHookTest is Test {
         router.swap(k, SwapParams(zeroForOne, -1e20, bound)); // swapping carries on
     }
 
-    /// @dev Re-audit: an empty pool's price moves for free, so the first liquidity must land at $1.
-    function test_theFirstLiquidityLandsAtTheDollar() public {
+    /// @dev Third round: the first deposit is protected by its own bounds, not by the hook. An attacker moves the
+    /// empty pool to $0.90 and pins it with 1 wei of liquidity (which switched the old guard off); a deposit then
+    /// needs more of one token than a $1 position's maximum, so PositionManager's mint would revert.
+    function test_aBoundedDepositRefusesAMovedPool() public {
         Tok st = new Tok("imdUSD4", 18);
         PegFeeHook h = _deployHook(address(st), address(usdc));
         PoolKey memory k = _key(h, 100, 1);
-        PM.initialize(k, h.pegSqrtPriceX96());
-        st.transfer(address(router), 1e30);
         uint160 peg = h.pegSqrtPriceX96();
+        PM.initialize(k, peg);
+        st.transfer(address(router), 1e30);
         bool sellStable0 = h.stableIsToken0();
         uint256 rel = h.stableIsToken0() ? 0.9e18 : uint256(1e36) / 0.9e18;
-        uint160 at90 = uint160(peg * _sqrt(rel * 1e18) / 1e18);
-        router.swap(k, SwapParams(sellStable0, -1, at90)); // moves the empty pool to $0.90 for nothing
-        ModifyLiquidityParams memory add = ModifyLiquidityParams(TickMath.MIN_TICK, TickMath.MAX_TICK, 1e18, 0);
-        vm.expectRevert();
-        router.addLiquidity(k, add);
-        router.swap(k, SwapParams(!sellStable0, -1, peg)); // restored, also for nothing
-        router.addLiquidity(k, add);
+        router.swap(k, SwapParams(sellStable0, -1, uint160(peg * _sqrt(rel * 1e18) / 1e18))); // free: the pool is empty
+        router.addLiquidity(k, ModifyLiquidityParams(TickMath.MIN_TICK, TickMath.MAX_TICK, 1, 0)); // pinned with 1 wei
+
+        int24 t = TickMath.getTickAtSqrtPrice(peg);
+        (int24 lo, int24 hi) = (t - 500, t + 500); // about ±5%
+        DeployPegHook s = new DeployPegHook();
+        (uint256 max0, uint256 max1) = s.maxesAt(peg, 1e15, lo, hi, 50); // 0.5% tolerance
+        (uint256 need0, uint256 need1) = _deposit(k, lo, hi, 1e15);
+        assertTrue(need0 > max0 || need1 > max1, "at the moved price one side exceeds its $1 maximum: the mint reverts");
+
+        router.swap(k, SwapParams(!sellStable0, -1e30, peg)); // restored (through 1 wei of liquidity)
+        (need0, need1) = _deposit(k, lo, hi - 0, 2e15);
+        (max0, max1) = s.maxesAt(peg, 2e15, lo, hi, 50);
+        assertLe(need0, max0, "at $1 it fits");
+        assertLe(need1, max1, "at $1 it fits");
+    }
+
+    /// @dev Add `liquidity` in [lo, hi] and return what it took of each token, as a mint would be charged.
+    function _deposit(PoolKey memory k, int24 lo, int24 hi, uint256 liquidity) private returns (uint256, uint256) {
+        (ERC20 t0, ERC20 t1) = (ERC20(Currency.unwrap(k.currency0)), ERC20(Currency.unwrap(k.currency1)));
+        (uint256 b0, uint256 b1) = (t0.balanceOf(address(router)), t1.balanceOf(address(router)));
+        router.addLiquidity(k, ModifyLiquidityParams(lo, hi, int256(liquidity), bytes32(liquidity)));
+        return (b0 - t0.balanceOf(address(router)), b1 - t1.balanceOf(address(router)));
     }
 
     function test_onlyThePoolManagerCalls() public {
         vm.expectRevert(PegFeeHook.NotPoolManager.selector);
         hook.unlockCallback(abi.encode(key.currency0, uint256(1)));
-        vm.expectRevert(PegFeeHook.NotPoolManager.selector);
-        hook.beforeAddLiquidity(address(this), key, ModifyLiquidityParams(0, 0, 0, 0), "");
         vm.expectRevert(PegFeeHook.NotPoolManager.selector);
         hook.afterSwap(address(this), key, SwapParams(true, -1, 0), BalanceDeltaLibrary.ZERO_DELTA, "");
         uint160 p = hook.pegSqrtPriceX96();
@@ -445,18 +460,17 @@ contract DeployPegHookForkTest is Test {
         address treasury = address(new MockTreasury(address(new MockVault(address(imdusd)))));
         DeployPegHook s = new DeployPegHook();
         (bytes32 salt, address hook) = s.mine(address(imdusd), treasury);
-        vm.setEnv("IMDUSD", vm.toString(address(imdusd)));
-        vm.setEnv("TREASURY", vm.toString(treasury));
-        vm.setEnv("SALT", vm.toString(uint256(salt)));
-        s.run();
+        s.deploy(address(imdusd), treasury, salt); // arguments, not vm.setEnv: env is shared across parallel suites
         PegFeeHook h = PegFeeHook(hook);
         assertEq(h.stable(), address(imdusd));
         assertEq(h.treasury(), treasury);
         bytes32 id = keccak256(abi.encode(s.poolKey(address(imdusd), hook)));
         uint256 slot0 = uint256(IPoolManager(0x000000000004444c5dc75cB358380D2e3dE08A90).extsload(keccak256(abi.encode(id, uint256(6)))));
         assertEq(uint160(slot0), h.pegSqrtPriceX96(), "pool opened at $1");
-        s.run(); // someone opened it first, or a rerun: skipped, not reverted
-        s.checkPrice();
+        s.deploy(address(imdusd), treasury, salt); // someone opened it first, or a rerun: skipped, not reverted
+        int24 t = TickMath.getTickAtSqrtPrice(h.pegSqrtPriceX96());
+        (uint256 m0, uint256 m1) = s.depositMaxesFor(address(imdusd), treasury, 1e15, t - 500, t + 500, 50);
+        assertGt(m0 + m1, 0);
     }
 
     function test_scriptRefusesTheWrongTreasuryOrDecimals() public {
@@ -485,8 +499,7 @@ contract PegFeeHookMathTest is Test {
         bytes32 initHash = keccak256(
             abi.encodePacked(type(PegFeeHook).creationCode, abi.encode(PM, address(st), address(q), address(0x7EA5)))
         );
-        uint160 flags = Hooks.BEFORE_INITIALIZE_FLAG | Hooks.BEFORE_ADD_LIQUIDITY_FLAG | Hooks.AFTER_SWAP_FLAG
-            | Hooks.AFTER_SWAP_RETURNS_DELTA_FLAG;
+        uint160 flags = Hooks.BEFORE_INITIALIZE_FLAG | Hooks.AFTER_SWAP_FLAG | Hooks.AFTER_SWAP_RETURNS_DELTA_FLAG;
         for (uint256 salt;; ++salt) {
             if (uint160(vm.computeCreate2Address(bytes32(salt), initHash, address(this))) & Hooks.ALL_HOOK_MASK == flags) {
                 h = new PegFeeHook{salt: bytes32(salt)}(IPoolManager(PM), address(st), address(q), address(0x7EA5));
