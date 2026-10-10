@@ -13,7 +13,7 @@ import {ModifyLiquidityParams, SwapParams} from "v4-core/src/types/PoolOperation
 import {LPFeeLibrary} from "v4-core/src/libraries/LPFeeLibrary.sol";
 import {TickMath} from "v4-core/src/libraries/TickMath.sol";
 import {Hooks} from "v4-core/src/libraries/Hooks.sol";
-import {PegFeeHook} from "src/PegFeeHook.sol";
+import {PegFeeHook, PEG_HOOK_FLAGS} from "src/PegFeeHook.sol";
 
 contract Tok is ERC20 {
     uint8 private immutable _d;
@@ -60,14 +60,23 @@ contract Router is IUnlockCallback {
     }
 
     function swap(PoolKey memory key, SwapParams memory p) external returns (BalanceDelta d) {
-        d = abi.decode(pm.unlock(abi.encode(false, key, abi.encode(p))), (BalanceDelta));
+        d = abi.decode(pm.unlock(abi.encode(false, key, abi.encode(p, bytes("")))), (BalanceDelta));
+    }
+
+    /// @dev A swap carrying hookData: the cashback's recipient, abi.encode(address).
+    function swap(PoolKey memory key, SwapParams memory p, bytes memory hookData) external returns (BalanceDelta d) {
+        d = abi.decode(pm.unlock(abi.encode(false, key, abi.encode(p, hookData))), (BalanceDelta));
     }
 
     function unlockCallback(bytes calldata data) external returns (bytes memory) {
         (bool liquidity, PoolKey memory key, bytes memory inner) = abi.decode(data, (bool, PoolKey, bytes));
         BalanceDelta d;
-        if (liquidity) (d,) = pm.modifyLiquidity(key, abi.decode(inner, (ModifyLiquidityParams)), "");
-        else d = pm.swap(key, abi.decode(inner, (SwapParams)), "");
+        if (liquidity) {
+            (d,) = pm.modifyLiquidity(key, abi.decode(inner, (ModifyLiquidityParams)), "");
+        } else {
+            (SwapParams memory p, bytes memory hookData) = abi.decode(inner, (SwapParams, bytes));
+            d = pm.swap(key, p, hookData);
+        }
         _square(key.currency0, BalanceDeltaLibrary.amount0(d));
         _square(key.currency1, BalanceDeltaLibrary.amount1(d));
         return abi.encode(d);
@@ -121,7 +130,7 @@ contract PegFeeHookTest is Test {
     function _deployHook(address stable, address quote) private returns (PegFeeHook h) {
         bytes memory init = abi.encodePacked(type(PegFeeHook).creationCode, abi.encode(PM, stable, quote, TREASURY));
         bytes32 initHash = keccak256(init);
-        uint160 flags = Hooks.BEFORE_INITIALIZE_FLAG | Hooks.AFTER_SWAP_FLAG | Hooks.AFTER_SWAP_RETURNS_DELTA_FLAG;
+        uint160 flags = PEG_HOOK_FLAGS;
         for (uint256 salt;; ++salt) {
             address a = vm.computeCreate2Address(bytes32(salt), initHash, address(this));
             if (uint160(a) & Hooks.ALL_HOOK_MASK == flags) {
@@ -335,6 +344,9 @@ contract PegFeeHookTest is Test {
         Currency c = r.zeroForOne ? key.currency1 : key.currency0; // exact-in: the output
         uint256 id = uint256(uint160(Currency.unwrap(c)));
         uint256 claims = PM.balanceOf(address(hook), id);
+        assertEq(hook.sweepable(c), 0, "reserved for restorers while the price is away");
+        _moveTo(1e18); // a restore with no recipient releases it all to the Treasury
+        assertEq(hook.sweepable(c), claims);
         assertEq(hook.sweep(c), claims);
         assertEq(PM.balanceOf(address(hook), id), 0);
         assertEq(ERC20(Currency.unwrap(c)).balanceOf(TREASURY), claims);
@@ -356,6 +368,7 @@ contract PegFeeHookTest is Test {
         router.swap(k, SwapParams(zeroForOne, -1e24, uint160(h.pegSqrtPriceX96() * _sqrt(rel * 1e18) / 1e18)));
         uint256 claims = PM.balanceOf(address(h), uint256(uint160(realUsdc)));
         assertGt(claims, 0);
+        router.swap(k, SwapParams(!zeroForOne, -1e30, h.pegSqrtPriceX96())); // back to $1: the pot is released
         uint256 before = ERC20(realUsdc).balanceOf(TREASURY);
         assertEq(h.sweep(Currency.wrap(realUsdc)), claims);
         assertEq(ERC20(realUsdc).balanceOf(TREASURY) - before, claims, "real USDC at the Treasury");
@@ -378,6 +391,8 @@ contract PegFeeHookTest is Test {
         uint256 id = uint256(uint160(address(q)));
         uint256 claims = PM.balanceOf(address(h), id);
         assertGt(claims, 0, "the surcharge is held as claims");
+        router.swap(k, SwapParams(!zeroForOne, -1e30, h.pegSqrtPriceX96())); // back to $1: the pot is released
+        assertEq(h.sweepable(Currency.wrap(address(q))), claims);
         vm.expectRevert();
         h.sweep(Currency.wrap(address(q)));
         assertEq(PM.balanceOf(address(h), id), claims, "and waits");
@@ -422,11 +437,136 @@ contract PegFeeHookTest is Test {
         return (b0 - t0.balanceOf(address(router)), b1 - t1.balanceOf(address(router)));
     }
 
+    // ---------------------------------------------------------------- the restorer's cashback (prototype)
+
+    address constant RESTORER = address(0xCA5B);
+
+    function _usdcIdx() private view returns (uint256) {
+        return _stableIs0() ? 1 : 0;
+    }
+
+    function _usdc() private view returns (Currency) {
+        return Currency.wrap(address(usdc));
+    }
+
+    /// @dev Move the price to `priceE18`, naming `recipient` in hookData (none if zero). Returns what it was paid.
+    function _restoreTo(uint256 priceE18, address recipient) private returns (uint256 gotUsdc, uint256 gotStable) {
+        (uint256 u, uint256 st) = (usdc.balanceOf(recipient), imdusd.balanceOf(recipient));
+        bool zeroForOne = (priceE18 < _price()) == _stableIs0();
+        bytes memory hookData = recipient == address(0) ? bytes("") : abi.encode(recipient);
+        router.swap(key, SwapParams(zeroForOne, -1e27, _sqrtAt(priceE18)), hookData);
+        (gotUsdc, gotStable) = (usdc.balanceOf(recipient) - u, imdusd.balanceOf(recipient) - st);
+    }
+
+    function test_aPushReservesItsSurchargeInThePotOfItsSide() public {
+        Swap memory r = _moveTo(0.97e18); // an exact-in sale: the surcharge is in USDC
+        assertGt(r.surcharge, 0);
+        assertEq(hook.pot(hook.BELOW(), _usdcIdx()), r.surcharge);
+        assertEq(hook.pot(hook.BELOW(), 1 - _usdcIdx()) + hook.pot(hook.ABOVE(), 0) + hook.pot(hook.ABOVE(), 1), 0);
+        assertEq(hook.sweepable(_usdc()), 0);
+    }
+
+    function test_aRestoreToTheBandPaysTheRecipientHalfAndReleasesTheRest() public {
+        Swap memory r = _moveTo(0.97e18);
+        (uint256 got, uint256 gotStable) = _restoreTo(0.999e18, RESTORER); // into the band: the whole pot
+        assertEq(got, r.surcharge * hook.REBATE_BPS() / 10_000);
+        assertEq(gotStable, 0);
+        assertEq(hook.pot(hook.BELOW(), _usdcIdx()), 0);
+        assertEq(hook.sweepable(_usdc()), r.surcharge - got, "the rest to the Treasury");
+    }
+
+    function test_withNoRecipientTheTreasuryGetsItAll() public {
+        Swap memory r = _moveTo(0.97e18);
+        bool zeroForOne = !_stableIs0(); // buys the stable
+        router.swap(key, SwapParams(zeroForOne, -1e27, _sqrtAt(0.999e18)), abi.encode(RESTORER, uint256(1)));
+        assertEq(usdc.balanceOf(RESTORER), 0, "hookData that is not one address names no one");
+        assertEq(hook.sweepable(_usdc()), r.surcharge);
+        assertEq(hook.sweep(_usdc()), r.surcharge);
+    }
+
+    function test_aPartialRestorePaysItsShareOfTheDistance() public {
+        Swap memory r = _moveTo(0.98e18); // 2% off: the cap
+        (uint256 got,) = _restoreTo(0.99e18, RESTORER); // covers 1 of the 1.75 points between the cap and the band
+        uint256 released = r.surcharge * 100 / 175;
+        assertApproxEqAbs(got, released / 2, 2);
+        assertApproxEqAbs(hook.pot(hook.BELOW(), _usdcIdx()), r.surcharge - released, 2);
+    }
+
+    function test_aRestoreSplitInStepsIsPaidWhatOneSwapWouldBe() public {
+        _moveTo(0.98e18);
+        uint256 snap = vm.snapshotState();
+        (uint256 once,) = _restoreTo(0.99e18, RESTORER);
+        vm.revertToState(snap);
+        uint256 sliced;
+        for (uint256 i = 1; i <= 10; ++i) {
+            (uint256 got,) = _restoreTo(0.98e18 + i * 0.001e18, RESTORER);
+            sliced += got;
+        }
+        assertApproxEqAbs(_price(), 0.99e18, 1e12);
+        assertLe(sliced, once + 10, "never more than one swap, beyond rounding");
+        assertApproxEqRel(sliced, once, 1e14);
+    }
+
+    function test_movesBeyondTheCapReleaseNothing() public {
+        _moveTo(0.97e18);
+        _moveTo(0.9e18); // further out: more surcharge, all reserved
+        uint256 reserved = hook.pot(hook.BELOW(), _usdcIdx());
+        (uint256 got,) = _restoreTo(0.975e18, RESTORER); // back, but never inside the cap
+        assertEq(got, 0);
+        assertEq(hook.pot(hook.BELOW(), _usdcIdx()), reserved);
+    }
+
+    function test_pushingFurtherToGrowThePotLoses() public {
+        _moveTo(0.99e18); // someone else's sale: the pot a restorer competes for
+        uint256 snap = vm.snapshotState();
+        (uint256 honest,) = _restoreTo(1e18, RESTORER);
+        vm.revertToState(snap);
+        Swap memory push = _moveTo(0.98e18); // the restorer pushes it further first
+        (uint256 gamed,) = _restoreTo(1e18, RESTORER);
+        assertGt(gamed, honest);
+        assertLt(gamed - honest, push.surcharge, "the extra cashback is less than the surcharge that bought it");
+    }
+
+    function test_aSurchargedCrossingPaysNoCashbackButFreesThePotItLeft() public {
+        Swap memory down = _moveTo(0.98e18);
+        bool zeroForOne = !_stableIs0(); // buys the stable, from $0.98 to $1.03
+        router.swap(key, SwapParams(zeroForOne, -1e27, _sqrtAt(1.03e18)), abi.encode(RESTORER));
+        assertEq(usdc.balanceOf(RESTORER) + imdusd.balanceOf(RESTORER), 0);
+        assertEq(hook.pot(hook.BELOW(), _usdcIdx()), 0);
+        assertEq(hook.sweepable(_usdc()), down.surcharge, "the pot it left goes to the Treasury");
+        assertGt(hook.pot(hook.ABOVE(), 1 - _usdcIdx()), 0, "its own surcharge (in imdUSD) is reserved above");
+    }
+
+    /// forge-config: default.fuzz.runs = 48
+    function testFuzz_claimsAlwaysCoverThePotsAndThePegEmptiesThem(uint256 seed) public {
+        for (uint256 i; i < 8; ++i) {
+            seed = uint256(keccak256(abi.encode(seed, i)));
+            uint256 target = 0.9e18 + seed % 0.2e18; // $0.90 .. $1.10
+            if (target == _price()) continue;
+            _restoreTo(target, seed >> 128 & 1 == 0 ? address(0) : RESTORER);
+            for (uint256 c; c < 2; ++c) {
+                Currency cur = c == 0 ? key.currency0 : key.currency1;
+                uint256 reserved = hook.pot(0, c) + hook.pot(1, c);
+                assertGe(PM.balanceOf(address(hook), cur.toId()), reserved);
+                hook.sweepable(cur); // never underflows
+            }
+        }
+        _restoreTo(1e18, address(0));
+        for (uint256 c; c < 2; ++c) {
+            assertEq(hook.pot(0, c) + hook.pot(1, c), 0, "back at $1, nothing stays reserved");
+            Currency cur = c == 0 ? key.currency0 : key.currency1;
+            hook.sweep(cur);
+            assertEq(PM.balanceOf(address(hook), cur.toId()), 0);
+        }
+    }
+
     function test_onlyThePoolManagerCalls() public {
         vm.expectRevert(PegFeeHook.NotPoolManager.selector);
         hook.unlockCallback(abi.encode(key.currency0, uint256(1)));
         vm.expectRevert(PegFeeHook.NotPoolManager.selector);
         hook.afterSwap(address(this), key, SwapParams(true, -1, 0), BalanceDeltaLibrary.ZERO_DELTA, "");
+        vm.expectRevert(PegFeeHook.NotPoolManager.selector);
+        hook.beforeSwap(address(this), key, SwapParams(true, -1, 0), "");
         uint160 p = hook.pegSqrtPriceX96();
         vm.expectRevert(PegFeeHook.NotPoolManager.selector);
         hook.beforeInitialize(address(this), key, p);
@@ -499,7 +639,7 @@ contract PegFeeHookMathTest is Test {
         bytes32 initHash = keccak256(
             abi.encodePacked(type(PegFeeHook).creationCode, abi.encode(PM, address(st), address(q), address(0x7EA5)))
         );
-        uint160 flags = Hooks.BEFORE_INITIALIZE_FLAG | Hooks.AFTER_SWAP_FLAG | Hooks.AFTER_SWAP_RETURNS_DELTA_FLAG;
+        uint160 flags = PEG_HOOK_FLAGS;
         for (uint256 salt;; ++salt) {
             if (uint160(vm.computeCreate2Address(bytes32(salt), initHash, address(this))) & Hooks.ALL_HOOK_MASK == flags) {
                 h = new PegFeeHook{salt: bytes32(salt)}(IPoolManager(PM), address(st), address(q), address(0x7EA5));

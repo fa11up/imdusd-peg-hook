@@ -10,7 +10,7 @@ import {StateLibrary} from "v4-core/src/libraries/StateLibrary.sol";
 import {Hooks} from "v4-core/src/libraries/Hooks.sol";
 import {TickMath} from "v4-core/src/libraries/TickMath.sol";
 import {SqrtPriceMath} from "v4-core/src/libraries/SqrtPriceMath.sol";
-import {PegFeeHook, IDecimals} from "src/PegFeeHook.sol";
+import {PegFeeHook, IDecimals, PEG_HOOK_FLAGS} from "src/PegFeeHook.sol";
 
 interface ITreasuryLike {
     function vault() external view returns (address);
@@ -50,7 +50,7 @@ contract DeployPegHook is Script {
     IPoolManager constant POOL_MANAGER = IPoolManager(0x000000000004444c5dc75cB358380D2e3dE08A90);
     address constant USDC = 0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48;
     uint256 constant MAX_SALTS = 2_000_000;
-    uint160 constant FLAGS = Hooks.BEFORE_INITIALIZE_FLAG | Hooks.AFTER_SWAP_FLAG | Hooks.AFTER_SWAP_RETURNS_DELTA_FLAG;
+    uint160 constant FLAGS = PEG_HOOK_FLAGS;
 
     function initCode(address imdUsd, address treasury) public pure returns (bytes memory) {
         return abi.encodePacked(type(PegFeeHook).creationCode, abi.encode(POOL_MANAGER, imdUsd, USDC, treasury));
