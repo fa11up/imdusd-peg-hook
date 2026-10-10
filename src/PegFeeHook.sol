@@ -3,7 +3,9 @@ pragma solidity 0.8.26;
 
 import {IHooks} from "v4-core/src/interfaces/IHooks.sol";
 import {IPoolManager} from "v4-core/src/interfaces/IPoolManager.sol";
+import {IUnlockCallback} from "v4-core/src/interfaces/callback/IUnlockCallback.sol";
 import {PoolKey} from "v4-core/src/types/PoolKey.sol";
+import {PoolId} from "v4-core/src/types/PoolId.sol";
 import {Currency} from "v4-core/src/types/Currency.sol";
 import {BalanceDelta} from "v4-core/src/types/BalanceDelta.sol";
 import {BeforeSwapDelta} from "v4-core/src/types/BeforeSwapDelta.sol";
@@ -20,26 +22,40 @@ interface IDecimals {
 /// @notice The imdUSD/USDC v4 pool's peg fee. Every swap pays the pool's LP fee, BASE_FEE (0.01%). A swap that ends
 /// with the price further from $1 than ±BAND_BPS, having pushed it there, also pays a surcharge priced from where it
 /// ENDS: rising in a straight line from nothing at the band's edge to MAX_FEE − BASE_FEE at CAP_AT_BPS from $1, and
-/// flat beyond. The surcharge goes to the imdUSD Treasury. A swap that moves the price towards $1 pays no surcharge.
-/// @dev Deployed at a mined CREATE2 salt (its address must carry exactly BEFORE_INITIALIZE, AFTER_SWAP and
-/// AFTER_SWAP_RETURNS_DELTA) by script/DeployPegHook.s.sol, which also creates the pool at $1.
+/// flat beyond. The surcharge is held as PoolManager claims and swept to the imdUSD Treasury. A swap that leaves the
+/// price no further from $1 on its own side, or inside the band, pays no surcharge.
+/// @dev Deployed at a mined CREATE2 salt (its address must carry exactly BEFORE_INITIALIZE, BEFORE_ADD_LIQUIDITY,
+/// AFTER_SWAP and AFTER_SWAP_RETURNS_DELTA) by script/DeployPegHook.s.sol, which also creates the pool at $1.
 ///
 /// Why the END price (swarm audit 5648bda5, high, all four specialists): a fee set from the price before a swap can
 /// be routed around. A seller first trades back towards $1 at the floor, bringing the price into the band, then sells
 /// any size in one swap, still at the floor; or one swap crosses $1 and lands far on the other side at the floor.
-/// Priced from where a swap ends, both pay for how far they push. A sale split into steps pays each step at its own
-/// end price, so about the average rate along the way (less than one swap pays at the final price, never the floor).
-/// Copies of this hook at other mined addresses open their own pools; integrations pin this hook's poolId.
+/// Priced from where a swap ends, both pay for how far they push. Two consequences, stated plainly (re-audit
+/// 3d492b20): a sale split into steps pays each step at its own end price, so a third to a half less than one swap
+/// ending at the same price (never the floor); and a swap that crosses $1 is charged by where it lands, on its whole
+/// unspecified amount, even if it started further from $1 on the other side. Copies of this hook at other mined
+/// addresses open their own pools; integrations pin this hook's poolId.
+///
+/// The surcharge never moves a token during a swap (re-audit 3d492b20, medium): afterSwap MINTS it as ERC-6909
+/// claims to this hook, which needs neither the token's transfer to succeed nor the PoolManager to hold it yet, so no
+/// swap can revert on it (a Treasury the token refuses, or an exact-output sale whose input has not arrived). Anyone
+/// calls `sweep(currency)` to turn the claims into tokens at the Treasury; if that transfer is refused, the claims
+/// wait and swapping carries on.
+///
+/// The first liquidity lands at $1 (re-audit 3d492b20): while the pool has no active liquidity its price can be moved
+/// for free, so `beforeAddLiquidity` then refuses any add unless the price is inside the band. A pool someone moved
+/// makes the deposit revert instead of landing at their price; restore it (a swap through an empty pool costs
+/// nothing) and add again.
 ///
 /// The surcharge is taken in the swap's unspecified currency (the output of an exact-input swap, the input of an
 /// exact-output one), as v4's FeeTakingHook does: the hook returns it as an afterSwap delta, so the swapper pays it,
-/// and takes it straight to the Treasury. Why these numbers: a 5% cap equals the redemption fee's cap, so once the
-/// fee is at its cap the pool is never a cheaper exit than redemption, and selling pressure in a depeg goes to
-/// redemption (which burns imdUSD) instead of draining LPs. Reaching it at $0.98 keeps it inside the LPs' ±5% range.
+/// and keeps it as claims. Why these numbers: a 5% cap equals the redemption fee's cap, so a single swap ending at the
+/// cap pays as much as redeeming (per swap, not per exit: a sliced sale pays less, as above; and an exact-output
+/// swap's surcharge is on its input). Reaching it at $0.98 keeps it inside the LPs' ±5% range.
 ///
 /// It attaches to exactly one pool: `beforeInitialize` refuses any key that is not (imdUSD, USDC), fee BASE_FEE,
 /// TICK_SPACING, with this hook, and any opening price but exactly $1. No owner, no parameters to change, no storage.
-contract PegFeeHook is IHooks {
+contract PegFeeHook is IHooks, IUnlockCallback {
     using StateLibrary for IPoolManager;
 
     uint24 public constant BASE_FEE = 100; // 0.01%, the pool's static LP fee
@@ -49,8 +65,8 @@ contract PegFeeHook is IHooks {
     int24 public constant TICK_SPACING = 1; // the one pool's spacing: any other spacing would be a second pool
     uint256 private constant PIPS = 1_000_000;
 
-    uint160 public constant FLAGS =
-        Hooks.BEFORE_INITIALIZE_FLAG | Hooks.AFTER_SWAP_FLAG | Hooks.AFTER_SWAP_RETURNS_DELTA_FLAG;
+    uint160 public constant FLAGS = Hooks.BEFORE_INITIALIZE_FLAG | Hooks.BEFORE_ADD_LIQUIDITY_FLAG | Hooks.AFTER_SWAP_FLAG
+        | Hooks.AFTER_SWAP_RETURNS_DELTA_FLAG;
 
     IPoolManager public immutable poolManager;
     address public immutable stable; // imdUSD
@@ -66,6 +82,9 @@ contract PegFeeHook is IHooks {
     error OddDecimalGap();
     error ZeroAddress();
     error NotImplemented();
+    error EmptyPoolOffPeg();
+
+    event Swept(Currency indexed currency, uint256 amount);
 
     /// @dev Reads both tokens' decimals itself, so a wrong decimals argument cannot open the pool off the peg
     /// (swarm audit 5648bda5, low).
@@ -92,6 +111,7 @@ contract PegFeeHook is IHooks {
     /// @notice The callbacks this hook uses, as v4 tooling and BaseHook expect (swarm audit 5648bda5, medium).
     function getHookPermissions() external pure returns (Hooks.Permissions memory p) {
         p.beforeInitialize = true;
+        p.beforeAddLiquidity = true;
         p.afterSwap = true;
         p.afterSwapReturnDelta = true;
     }
@@ -127,8 +147,42 @@ contract PegFeeHook is IHooks {
         uint256 abs = amount < 0 ? uint256(-int256(amount)) : uint256(int256(amount));
         uint256 surcharge = abs * pips / PIPS; // pips < PIPS, so surcharge < abs <= 2^127: fits int128
         if (surcharge == 0) return (IHooks.afterSwap.selector, 0);
-        poolManager.take(currency, treasury, surcharge);
+        // Claims, not a transfer: the returned delta credits this hook and the mint debits it, so it ends square.
+        poolManager.mint(address(this), currency.toId(), surcharge);
         return (IHooks.afterSwap.selector, int128(int256(surcharge)));
+    }
+
+    /// @notice While the pool has no active liquidity, refuse an add unless the price is inside the band.
+    function beforeAddLiquidity(address, PoolKey calldata key, ModifyLiquidityParams calldata, bytes calldata)
+        external
+        view
+        onlyPoolManager
+        returns (bytes4)
+    {
+        PoolId id = key.toId();
+        if (poolManager.getLiquidity(id) == 0) {
+            (uint160 sqrtPriceX96,,,) = poolManager.getSlot0(id);
+            uint256 p = stablePrice(sqrtPriceX96);
+            if ((p > 1e18 ? p - 1e18 : 1e18 - p) > BAND_BPS * 1e14) revert EmptyPoolOffPeg();
+        }
+        return IHooks.beforeAddLiquidity.selector;
+    }
+
+    // ---------------------------------------------------------------- the surcharge, to the Treasury
+
+    /// @notice Turn this hook's claims on `currency` into tokens at the Treasury. Anyone may call it.
+    function sweep(Currency currency) external returns (uint256 amount) {
+        amount = poolManager.balanceOf(address(this), currency.toId());
+        if (amount == 0) return 0;
+        poolManager.unlock(abi.encode(currency, amount));
+        emit Swept(currency, amount);
+    }
+
+    function unlockCallback(bytes calldata data) external onlyPoolManager returns (bytes memory) {
+        (Currency currency, uint256 amount) = abi.decode(data, (Currency, uint256));
+        poolManager.burn(address(this), currency.toId(), amount);
+        poolManager.take(currency, treasury, amount);
+        return "";
     }
 
     // ---------------------------------------------------------------- views
@@ -171,14 +225,6 @@ contract PegFeeHook is IHooks {
     // ---------------------------------------------------------------- unused (their flag bits are not set)
 
     function afterInitialize(address, PoolKey calldata, uint160, int24) external pure returns (bytes4) {
-        revert NotImplemented();
-    }
-
-    function beforeAddLiquidity(address, PoolKey calldata, ModifyLiquidityParams calldata, bytes calldata)
-        external
-        pure
-        returns (bytes4)
-    {
         revert NotImplemented();
     }
 

@@ -28,6 +28,25 @@ contract Tok is ERC20 {
     }
 }
 
+/// @dev A token that refuses transfers to one address, as USDC does to a blacklisted one.
+contract Refusing is ERC20 {
+    address immutable refused;
+
+    constructor(address r) ERC20("USDC-like", "USDC") {
+        refused = r;
+        _mint(msg.sender, 1e40);
+    }
+
+    function decimals() public pure override returns (uint8) {
+        return 6;
+    }
+
+    function _update(address from, address to, uint256 v) internal override {
+        require(to != refused, "blacklisted");
+        super._update(from, to, v);
+    }
+}
+
 /// @dev The smallest router: one unlock per action, settling what it owes and taking what it is owed.
 contract Router is IUnlockCallback {
     IPoolManager immutable pm;
@@ -102,7 +121,8 @@ contract PegFeeHookTest is Test {
     function _deployHook(address stable, address quote) private returns (PegFeeHook h) {
         bytes memory init = abi.encodePacked(type(PegFeeHook).creationCode, abi.encode(PM, stable, quote, TREASURY));
         bytes32 initHash = keccak256(init);
-        uint160 flags = Hooks.BEFORE_INITIALIZE_FLAG | Hooks.AFTER_SWAP_FLAG | Hooks.AFTER_SWAP_RETURNS_DELTA_FLAG;
+        uint160 flags = Hooks.BEFORE_INITIALIZE_FLAG | Hooks.BEFORE_ADD_LIQUIDITY_FLAG | Hooks.AFTER_SWAP_FLAG
+            | Hooks.AFTER_SWAP_RETURNS_DELTA_FLAG;
         for (uint256 salt;; ++salt) {
             address a = vm.computeCreate2Address(bytes32(salt), initHash, address(this));
             if (uint160(a) & Hooks.ALL_HOOK_MASK == flags) {
@@ -119,7 +139,7 @@ contract PegFeeHookTest is Test {
 
     struct Swap {
         uint24 lpFee; // from the PoolManager's Swap event
-        uint256 surcharge; // what the Treasury received
+        uint256 surcharge; // the claims the hook gained
         uint256 unspecified; // the swap's unspecified amount before the surcharge (|output| exact-in, |input| exact-out)
         uint160 endSqrtPrice;
         bool zeroForOne;
@@ -132,8 +152,8 @@ contract PegFeeHookTest is Test {
         // The surcharge is in the unspecified currency: token1 when token0 is specified, and token0 is specified
         // for an exact-in zeroForOne or an exact-out oneForZero.
         bool specifiedIs0 = exactIn == r.zeroForOne;
-        ERC20 unspec = ERC20(Currency.unwrap(specifiedIs0 ? key.currency1 : key.currency0));
-        uint256 before = unspec.balanceOf(TREASURY);
+        uint256 cid = uint256(uint160(Currency.unwrap(specifiedIs0 ? key.currency1 : key.currency0)));
+        uint256 before = PM.balanceOf(address(hook), cid);
         vm.recordLogs();
         BalanceDelta d = router.swap(key, SwapParams(r.zeroForOne, exactIn ? -int256(amount) : int256(amount), limit));
         Vm.Log[] memory logs = vm.getRecordedLogs();
@@ -143,7 +163,7 @@ contract PegFeeHookTest is Test {
                 break;
             }
         }
-        r.surcharge = unspec.balanceOf(TREASURY) - before;
+        r.surcharge = PM.balanceOf(address(hook), cid) - before;
         int128 paid = specifiedIs0 ? BalanceDeltaLibrary.amount1(d) : BalanceDeltaLibrary.amount0(d);
         uint256 abs = paid < 0 ? uint256(-int256(paid)) : uint256(int256(paid));
         // The swapper's delta already carries the surcharge: received less (exact-in) or paid more (exact-out).
@@ -308,7 +328,68 @@ contract PegFeeHookTest is Test {
         hook.surchargeFor(TickMath.MAX_SQRT_PRICE - 1, false);
     }
 
+    // ---------------------------------------------------------------- claims, sweep, the first liquidity
+
+    function test_sweepMovesTheClaimsToTheTreasury() public {
+        Swap memory r = _swap(true, 1e27, _sqrtAt(0.97e18), true);
+        assertGt(r.surcharge, 0);
+        Currency c = r.zeroForOne ? key.currency1 : key.currency0; // exact-in: the output
+        uint256 id = uint256(uint160(Currency.unwrap(c)));
+        uint256 claims = PM.balanceOf(address(hook), id);
+        assertEq(hook.sweep(c), claims);
+        assertEq(PM.balanceOf(address(hook), id), 0);
+        assertEq(ERC20(Currency.unwrap(c)).balanceOf(TREASURY), claims);
+        assertEq(hook.sweep(c), 0, "nothing left");
+    }
+
+    /// @dev Re-audit medium: a Treasury the token refuses (a USDC blacklist) used to revert every surcharged swap.
+    function test_aTreasuryTheTokenRefusesNeverStopsASwap() public {
+        Refusing q = new Refusing(TREASURY);
+        Tok st = new Tok("imdUSD3", 18);
+        PegFeeHook h = _deployHook(address(st), address(q));
+        PoolKey memory k = _key(h, 100, 1);
+        PM.initialize(k, h.pegSqrtPriceX96());
+        st.transfer(address(router), 1e30);
+        q.transfer(address(router), 1e30);
+        router.addLiquidity(k, ModifyLiquidityParams(TickMath.MIN_TICK, TickMath.MAX_TICK, 1e18, 0));
+        bool zeroForOne = h.stableIsToken0(); // sells the stable: output is the refusing token
+        uint256 rel = h.stableIsToken0() ? 0.97e18 : uint256(1e36) / 0.97e18;
+        uint160 limit = uint160(h.pegSqrtPriceX96() * _sqrt(rel * 1e18) / 1e18);
+        router.swap(k, SwapParams(zeroForOne, -1e27, limit)); // does not revert
+        uint256 id = uint256(uint160(address(q)));
+        uint256 claims = PM.balanceOf(address(h), id);
+        assertGt(claims, 0, "the surcharge is held as claims");
+        vm.expectRevert();
+        h.sweep(Currency.wrap(address(q)));
+        assertEq(PM.balanceOf(address(h), id), claims, "and waits");
+        uint160 bound = zeroForOne ? TickMath.MIN_SQRT_PRICE + 1 : TickMath.MAX_SQRT_PRICE - 1;
+        router.swap(k, SwapParams(zeroForOne, -1e20, bound)); // swapping carries on
+    }
+
+    /// @dev Re-audit: an empty pool's price moves for free, so the first liquidity must land at $1.
+    function test_theFirstLiquidityLandsAtTheDollar() public {
+        Tok st = new Tok("imdUSD4", 18);
+        PegFeeHook h = _deployHook(address(st), address(usdc));
+        PoolKey memory k = _key(h, 100, 1);
+        PM.initialize(k, h.pegSqrtPriceX96());
+        st.transfer(address(router), 1e30);
+        uint160 peg = h.pegSqrtPriceX96();
+        bool sellStable0 = h.stableIsToken0();
+        uint256 rel = h.stableIsToken0() ? 0.9e18 : uint256(1e36) / 0.9e18;
+        uint160 at90 = uint160(peg * _sqrt(rel * 1e18) / 1e18);
+        router.swap(k, SwapParams(sellStable0, -1, at90)); // moves the empty pool to $0.90 for nothing
+        ModifyLiquidityParams memory add = ModifyLiquidityParams(TickMath.MIN_TICK, TickMath.MAX_TICK, 1e18, 0);
+        vm.expectRevert();
+        router.addLiquidity(k, add);
+        router.swap(k, SwapParams(!sellStable0, -1, peg)); // restored, also for nothing
+        router.addLiquidity(k, add);
+    }
+
     function test_onlyThePoolManagerCalls() public {
+        vm.expectRevert(PegFeeHook.NotPoolManager.selector);
+        hook.unlockCallback(abi.encode(key.currency0, uint256(1)));
+        vm.expectRevert(PegFeeHook.NotPoolManager.selector);
+        hook.beforeAddLiquidity(address(this), key, ModifyLiquidityParams(0, 0, 0, 0), "");
         vm.expectRevert(PegFeeHook.NotPoolManager.selector);
         hook.afterSwap(address(this), key, SwapParams(true, -1, 0), BalanceDeltaLibrary.ZERO_DELTA, "");
         uint160 p = hook.pegSqrtPriceX96();
@@ -369,5 +450,62 @@ contract DeployPegHookForkTest is Test {
         address t6 = address(new MockTreasury(address(new MockVault(address(six)))));
         vm.expectRevert(bytes("IMDUSD has no code or not 18 decimals"));
         s.check(address(six), t6);
+    }
+}
+
+/// @notice The fee arithmetic, with no fork: runs wherever the suite runs (re-audit 3d492b20, info).
+contract PegFeeHookMathTest is Test {
+    address constant PM = address(0xBEEF); // never called by the views tested here
+    PegFeeHook h;
+    bool sell; // the direction that sells the stable
+
+    function setUp() public {
+        Tok st = new Tok("imdUSD", 18);
+        Tok q = new Tok("USDC", 6);
+        bytes32 initHash = keccak256(
+            abi.encodePacked(type(PegFeeHook).creationCode, abi.encode(PM, address(st), address(q), address(0x7EA5)))
+        );
+        uint160 flags = Hooks.BEFORE_INITIALIZE_FLAG | Hooks.BEFORE_ADD_LIQUIDITY_FLAG | Hooks.AFTER_SWAP_FLAG
+            | Hooks.AFTER_SWAP_RETURNS_DELTA_FLAG;
+        for (uint256 salt;; ++salt) {
+            if (uint160(vm.computeCreate2Address(bytes32(salt), initHash, address(this))) & Hooks.ALL_HOOK_MASK == flags) {
+                h = new PegFeeHook{salt: bytes32(salt)}(IPoolManager(PM), address(st), address(q), address(0x7EA5));
+                break;
+            }
+        }
+        sell = h.stableIsToken0();
+    }
+
+    function _at(uint256 priceE18) private view returns (uint160) {
+        uint256 rel = h.stableIsToken0() ? priceE18 : uint256(1e36) / priceE18;
+        uint256 x = rel * 1e18;
+        uint256 y = x;
+        uint256 z = (x + 1) / 2;
+        while (z < y) (y, z) = (z, (x / z + z) / 2);
+        return uint160(h.pegSqrtPriceX96() * y / 1e18);
+    }
+
+    function test_atThePegThePriceIsOneDollar() public view {
+        assertApproxEqRel(h.stablePrice(h.pegSqrtPriceX96()), 1e18, 1e6);
+        Hooks.validateHookPermissions(IHooks(address(h)), h.getHookPermissions());
+    }
+
+    function test_noSurchargeInsideTheBandOrTowardsTheDollar() public view {
+        assertEq(h.surchargeFor(_at(0.998e18), sell), 0, "inside the band");
+        assertEq(h.surchargeFor(_at(0.99e18), !sell), 0, "below, buying: towards");
+        assertEq(h.surchargeFor(_at(1.01e18), sell), 0, "above, selling: towards");
+    }
+
+    function test_theRampAndTheCap() public view {
+        // 1% off, away: 75/175 of the way to 4.99% (±3 pips for the square root's rounding)
+        assertApproxEqAbs(h.surchargeFor(_at(0.99e18), sell), uint256(49_900) * 75 / 175, 3);
+        assertApproxEqAbs(h.surchargeFor(_at(1.01e18), !sell), uint256(49_900) * 75 / 175, 3);
+        assertEq(h.surchargeFor(_at(0.97e18), sell), 49_900, "past the cap");
+        assertEq(h.feeFor(_at(0.97e18), sell), 50_000);
+    }
+
+    function test_extremesNeverRevert() public view {
+        h.surchargeFor(TickMath.MIN_SQRT_PRICE, true);
+        h.surchargeFor(TickMath.MAX_SQRT_PRICE - 1, false);
     }
 }

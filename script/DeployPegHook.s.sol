@@ -14,6 +14,10 @@ interface ITreasuryLike {
     function vault() external view returns (address);
 }
 
+interface IFiatTokenLike {
+    function isBlacklisted(address account) external view returns (bool);
+}
+
 interface IVaultLike {
     function stablecoin() external view returns (address);
 }
@@ -30,9 +34,9 @@ interface IVaultLike {
 /// Mining is deterministic (lowest salt that works), so plan and run agree, and the address is fixed by the
 /// hook's bytecode and its constructor arguments alone — whoever broadcasts gains no authority over it.
 ///
-/// Until the first liquidity lands, an empty pool's price can be moved by a swap that exchanges nothing (swarm audit
-/// 5648bda5, low). So the liquidity step runs `checkPrice()` first, or adds liquidity in the same transaction as any
-/// re-initialization through PositionManager's multicall.
+/// Until the first liquidity lands, an empty pool's price can be moved by a swap that exchanges nothing. The hook
+/// refuses liquidity added to an empty pool whose price is outside the band (re-audit 3d492b20), so such a deposit
+/// reverts rather than landing at a moved price; `checkPrice()` says beforehand whether it would.
 contract DeployPegHook is Script {
     using StateLibrary for IPoolManager;
 
@@ -40,7 +44,8 @@ contract DeployPegHook is Script {
     IPoolManager constant POOL_MANAGER = IPoolManager(0x000000000004444c5dc75cB358380D2e3dE08A90);
     address constant USDC = 0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48;
     uint256 constant MAX_SALTS = 2_000_000;
-    uint160 constant FLAGS = Hooks.BEFORE_INITIALIZE_FLAG | Hooks.AFTER_SWAP_FLAG | Hooks.AFTER_SWAP_RETURNS_DELTA_FLAG;
+    uint160 constant FLAGS = Hooks.BEFORE_INITIALIZE_FLAG | Hooks.BEFORE_ADD_LIQUIDITY_FLAG | Hooks.AFTER_SWAP_FLAG
+        | Hooks.AFTER_SWAP_RETURNS_DELTA_FLAG;
 
     function initCode(address imdUsd, address treasury) public pure returns (bytes memory) {
         return abi.encodePacked(type(PegFeeHook).creationCode, abi.encode(POOL_MANAGER, imdUsd, USDC, treasury));
@@ -72,6 +77,11 @@ contract DeployPegHook is Script {
         require(imdUsd.code.length != 0 && IDecimals(imdUsd).decimals() == 18, "IMDUSD has no code or not 18 decimals");
         require(treasury.code.length != 0, "TREASURY has no code");
         require(IVaultLike(ITreasuryLike(treasury).vault()).stablecoin() == imdUsd, "TREASURY is not imdUSD's Treasury");
+        // The one precondition of sweeping USDC that is checkable on chain (re-audit 3d492b20, low). Swaps never
+        // depend on it: the surcharge is held as claims until it can be swept.
+        try IFiatTokenLike(USDC).isBlacklisted(treasury) returns (bool listed) {
+            require(!listed, "USDC has blacklisted TREASURY");
+        } catch {}
     }
 
     function plan() external view {
@@ -119,7 +129,7 @@ contract DeployPegHook is Script {
         uint256 p = PegFeeHook(hook).stablePrice(sqrtP);
         console2.log("imdUSD price in USDC (1e18 = $1):", p);
         uint256 dev = p > 1e18 ? p - 1e18 : 1e18 - p;
-        require(dev <= 25e14, "the pool is outside the band: do not add liquidity; restore it to $1 first");
-        console2.log("inside the band: safe to add liquidity");
+        require(dev <= 25e14, "outside the band: an add to the empty pool would revert; restore it to $1 first");
+        console2.log("inside the band: liquidity can be added");
     }
 }
