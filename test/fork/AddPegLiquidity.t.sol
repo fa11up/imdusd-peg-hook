@@ -54,15 +54,16 @@ contract AddPegLiquidityForkTest is Test {
         (uint256 usdcMax, uint256 stableMax) = imdUsd < address(USDC) ? (m.amount1Max, m.amount0Max) : (m.amount0Max, m.amount1Max);
         assertLe(usdcSpent, usdcMax);
         assertLe(stableSpent, stableMax);
-        // A centred $0.95-$1.05 range at $1 takes nearly equal dollars of each side, all of one side bounded by the input.
-        assertGt(usdcSpent * 1e12 + stableSpent, 150_000e18, "most of the $200k went in");
+        // Balanced around $1: equal inputs go in almost entirely on both sides.
+        assertGt(usdcSpent, 99_900e6, "nearly all the USDC went in");
+        assertGt(stableSpent, 99_500e18, "nearly all the imdUSD went in (the peg sits between two ticks)");
         assertEq(USDC.allowance(address(s), PERMIT2), 0, "approvals reset");
         assertEq(IERC20(imdUsd).allowance(address(s), PERMIT2), 0, "approvals reset");
         emit log_named_uint("USDC in (6 dec)", usdcSpent);
         emit log_named_uint("imdUSD in (18 dec)", stableSpent);
     }
 
-    function test_rangeIsFiveCentsEachWay() public view {
+    function test_rangeIsBalancedAroundOneDollar() public view {
         (, address hook) = s.mine(imdUsd, treasury);
         (int24 lo, int24 hi) = s.range(imdUsd, hook);
         (bool okLo, bytes memory pLo) = hook.staticcall(abi.encodeWithSignature("stablePrice(uint160)", _sqrt(lo)));
@@ -70,7 +71,7 @@ contract AddPegLiquidityForkTest is Test {
         require(okLo && okHi);
         (uint256 a, uint256 b) = (abi.decode(pLo, (uint256)), abi.decode(pHi, (uint256)));
         (uint256 low, uint256 high) = a < b ? (a, b) : (b, a);
-        assertApproxEqRel(low, 0.95e18, 0.0002e18, "lower end $0.95");
+        assertApproxEqRel(low, 0.952380952380952380e18, 0.0002e18, "lower end $1/1.05");
         assertApproxEqRel(high, 1.05e18, 0.0002e18, "upper end $1.05");
     }
 

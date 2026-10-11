@@ -22,7 +22,7 @@ interface IPositionManagerLike {
     function nextTokenId() external view returns (uint256);
 }
 
-/// @notice The first (and any later) liquidity in the imdUSD/USDC peg pool: one PositionManager mint over $0.95–$1.05,
+/// @notice The first (and any later) liquidity in the imdUSD/USDC peg pool: one PositionManager mint over $0.9524–$1.05,
 /// bounded by `DeployPegHook.maxesAt` at $1, so a pool moved off the peg makes the mint revert instead of filling at a
 /// bad price (third audit round 442fd649).
 ///
@@ -41,9 +41,10 @@ contract AddPegLiquidity is DeployPegHook {
     IPositionManagerLike constant POSITION_MANAGER = IPositionManagerLike(0xbD216513d74C8cf14cf4747E6AaA6420FF64ee9e);
     uint8 constant MINT_POSITION = 0x02; // v4-periphery Actions
     uint8 constant SETTLE_PAIR = 0x0d;
-    // ln(1.05) / ln(1.0001) and ln(0.95) / ln(1.0001), rounded outward: $0.9500–$1.0500 of imdUSD in USDC.
+    // 488 ticks either side of the peg: $1/1.05 = $0.9524 to $1.05. Balanced around $1 in sqrt-price terms, so a deposit
+    // at the peg takes equal amounts of the two tokens (a $0.95 floor, 513 ticks down, took ~5% less imdUSD than USDC).
     int24 constant TICKS_UP = 488;
-    int24 constant TICKS_DOWN = 513;
+    int24 constant TICKS_DOWN = 488;
 
     struct Mint {
         PoolKey key;
